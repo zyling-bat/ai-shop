@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shared",
+    "crates/domain",
+    "crates/application",
+    "crates/infrastructure",
+    "crates/api",
+    "crates/ai-gateway",
+    "crates/ai-rag",
+    "crates/ai-agent",
+    "crates/worker",
+    "crates/channel",
+    "apps/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+axum = { version = "0.8", features = ["macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
