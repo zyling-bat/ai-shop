@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 api = { path = "../../crates/api" }
+infrastructure = { path = "../../crates/infrastructure" }
+shared = { path = "../../crates/shared" }
 axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true

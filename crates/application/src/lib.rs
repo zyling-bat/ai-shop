@@ -1,1 +1,4 @@
 //! 应用层：用例编排、端口定义、DTO 与工作单元。
+
+pub mod audit;
+pub mod health;

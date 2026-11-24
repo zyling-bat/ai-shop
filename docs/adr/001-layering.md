@@ -42,9 +42,17 @@ C3 要求依赖方向单向：领域层不感知框架，应用层不感知传�
 | `ai-agent` | `application`, `ai-gateway`, `shared` |
 | `worker` | `application`, `infrastructure`, `shared` |
 | `channel` | `application`, `shared` |
-| `apps/server` | `api`（+ 启动期依赖 tokio / axum / tracing） |
+| `apps/server` | `api`, `shared`（启动期配置类型；ST-0.2 起）, `infrastructure`（启动期装配连接池；ST-0.3 起）+ 启动期依赖 tokio / axum / tracing |
 
 白名单之外的边一律视为越界，评审按 C3 打回。
+
+本表的变更记录：
+
+| 日期 | ST | 变更 | 依据 |
+|---|---|---|---|
+| 2026-11-24 | ST-0.1 | 建表：11 个 crate 的初始依赖边 | C3、06 §6.2 |
+| 2026-11-24 | ST-0.2 | 新增 `apps/server → shared`（启动期配置类型 `AppConfig`） | 用户书面确认（本 ST Spec「待确认 3」）；配置需被 `infrastructure` 在 ST-0.3 复用，放 `shared` 避免二次搬迁 |
+| 2026-11-24 | ST-0.3 | 新增 `apps/server → infrastructure`（装配 PG / Redis 连接池、就绪探针与审计适配器） | 用户书面确认（`specs/ST-0.3.md`「待确认 1」）；server 只做装配，不写 SQL，SQL 全部在 `infrastructure` |
 
 ST-0.1 阶段各 crate 尚无代码，因此**只声明实际使用到的依赖**，不预埋未用依赖（避免"声明即依赖"的假约束）。上表中尚未落地的边，在该 crate 首次写入代码的 ST 里按本表补齐。
 
@@ -92,12 +100,12 @@ workspace 基线：
 
 | 编号 | 主题 | 预计归属 ST |
 |---|---|---|
-| ADR-002 | 数据库与 ORM（sqlx、迁移策略、连接池） | ST-0.3 |
-| ADR-003 | 缓存与分布式锁（Redis 客户端选型、锁语义） | ST-0.3 / P4 |
+| ADR-002 | 数据库与 ORM（sqlx、迁移策略、连接池） | ST-0.3（已落地） |
+| ADR-003 | 缓存与分布式锁（Redis 客户端选型、锁语义） | ST-0.3（已落地，锁协议 P4 实现） |
 | ADR-004 | 事务消息与 outbox 投递语义 | P5 |
 | ADR-005 | AI 网关（多厂商路由、配额、降级、结构化输出） | P11 |
 | ADR-006 | 前端形态（SSR / CSR / 小程序 build 链路） | P14 |
 | ADR-007 | 渠道接入（Web / H5 / 小程序 / App / 开放平台） | P14 |
-| ADR-008 | 可观测（tracing、metrics、OTel、trace 串联） | ST-0.2 / P16 |
+| ADR-008 | 可观测（tracing、metrics、OTel、trace 串联） | ST-0.2（已落地，OTLP 导出部分见 TD-001） |
 
 本表仅做编号占位，避免后续 ADR 抢号；各条在对应 ST 落地时单独成文。

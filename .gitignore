@@ -2,3 +2,7 @@
 .env
 .env.*
 *.local
+
+# 本机依赖安装包（便携包，不入库）
+/pg17.zip
+/redis-7.4.11.zip

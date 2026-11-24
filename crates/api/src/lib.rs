@@ -1,5 +1,9 @@
-//! HTTP 层：路由装配、中间件与错误映射。
+//! API 层：路由、中间件与协议转换。
 
+pub mod handlers;
+pub mod middleware;
 pub mod router;
+pub mod state;
 
 pub use router::router;
+pub use state::AppState;

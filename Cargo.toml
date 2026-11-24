@@ -24,8 +24,17 @@ publish = false
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
 axum = { version = "0.8", features = ["macros"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower = { version = "0.5", features = ["util"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+deadpool-redis = "0.23"
+async-trait = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
