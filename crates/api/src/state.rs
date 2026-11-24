@@ -5,8 +5,9 @@ use std::sync::Arc;
 use application::audit::AuditSink;
 use application::health::Readiness;
 use metrics_exporter_prometheus::PrometheusHandle;
+use shared::config::HttpConfig;
 
-/// 路由与中间件共享的状态。克隆成本为三个引用计数。
+/// 路由与中间件共享的状态。克隆成本为三个引用计数加一份护栏配置。
 #[derive(Clone)]
 pub struct AppState {
     /// Prometheus 渲染句柄。
@@ -15,6 +16,8 @@ pub struct AppState {
     pub readiness: Arc<Readiness>,
     /// 审计写入端口。
     pub audit: Arc<dyn AuditSink>,
+    /// 请求护栏参数。
+    pub http: HttpConfig,
 }
 
 impl AppState {
@@ -22,11 +25,13 @@ impl AppState {
         metrics: PrometheusHandle,
         readiness: Arc<Readiness>,
         audit: Arc<dyn AuditSink>,
+        http: HttpConfig,
     ) -> Self {
         Self {
             metrics,
             readiness,
             audit,
+            http,
         }
     }
 }

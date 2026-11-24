@@ -10,8 +10,12 @@ api = { path = "../../crates/api" }
 infrastructure = { path = "../../crates/infrastructure" }
 shared = { path = "../../crates/shared" }
 axum.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

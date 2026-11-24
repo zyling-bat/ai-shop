@@ -1,22 +1,36 @@
-//! 服务入口：装载配置、装配日志与指标，启动 axum 服务并处理优雅退出。
+//! 服务入口：装载配置、装配遥测与指标，启动 axum 服务并处理优雅退出。
+
+mod telemetry;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use shared::config::{AppConfig, LogConfig, LogFormat};
+use shared::config::{AppConfig, LogConfig, LogFormat, TelemetryConfig};
 use tracing_subscriber::EnvFilter;
 
 /// 启动期配置校验失败的退出码。
 const EXIT_CONFIG_INVALID: u8 = 2;
 /// 依赖（PostgreSQL / Redis）不可用的退出码。
 const EXIT_DEPENDENCY_UNAVAILABLE: u8 = 3;
+/// 遥测导出器装配失败的退出码。
+const EXIT_TELEMETRY_UNAVAILABLE: u8 = 4;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let vars: BTreeMap<String, String> = std::env::vars().collect();
 
-    // 先按日志相关配置装配输出，保证后续配置问题能被看见。
-    init_tracing(&LogConfig::from_map(&vars));
+    // 先按日志与遥测配置装配输出，保证后续配置问题能被看见。
+    let log = LogConfig::from_map(&vars);
+    let telemetry_config = TelemetryConfig::from_map(&vars);
+    let provider = match telemetry::build_provider(&telemetry_config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            init_tracing(&log);
+            tracing::error!(%error, "遥测导出器装配失败，进程退出");
+            return ExitCode::from(EXIT_TELEMETRY_UNAVAILABLE);
+        }
+    };
+    let telemetry = telemetry::install(&log, &telemetry_config.service_name, provider);
 
     let config = match AppConfig::from_map(&vars) {
         Ok(config) => config,
@@ -28,6 +42,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONFIG_INVALID);
         }
     };
+
+    tracing::info!(
+        service_name = %config.telemetry.service_name,
+        otlp_export = config.telemetry.otlp_endpoint.is_some(),
+        "telemetry initialized"
+    );
 
     let metrics = api::middleware::metrics::install()
         // INVARIANT: 进程内首次安装记录器，失败属于启动环境异常，必须终止。
@@ -46,6 +66,7 @@ async fn main() -> ExitCode {
         metrics,
         bootstrap.readiness.clone(),
         bootstrap.audit.clone(),
+        config.http.clone(),
     );
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
@@ -58,6 +79,9 @@ async fn main() -> ExitCode {
         env = config.app_env.as_str(),
         log_format = config.log.format.as_str(),
         database_max_connections = config.database.max_connections,
+        body_limit_bytes = config.http.body_limit_bytes,
+        timeout_secs = config.http.timeout_secs,
+        cors_allowed_origins = config.http.cors_allowed_origins.len(),
         "server listening"
     );
 
@@ -68,11 +92,12 @@ async fn main() -> ExitCode {
         .expect("axum 服务异常退出");
 
     bootstrap.pool.close().await;
+    telemetry.shutdown();
     tracing::info!("server stopped");
     ExitCode::SUCCESS
 }
 
-/// 装配日志输出：`RUST_LOG` 过滤 + `pretty` / `json` 二选一。
+/// 兜底日志装配：遥测初始化失败时至少保证错误信息可输出。
 fn init_tracing(log: &LogConfig) {
     let filter = EnvFilter::try_new(&log.filter).unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);

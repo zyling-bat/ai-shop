@@ -7,6 +7,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 
+use crate::middleware::propagation::TraceId;
 use crate::middleware::request_id::RequestId;
 use crate::state::AppState;
 
@@ -27,6 +28,11 @@ pub async fn layer(State(state): State<AppState>, req: Request, next: Next) -> R
         .get::<RequestId>()
         .map(|id| id.as_str().to_owned())
         .unwrap_or_default();
+    let trace_id = req
+        .extensions()
+        .get::<TraceId>()
+        .map(|id| id.as_str().to_owned())
+        .unwrap_or_default();
 
     let started = Instant::now();
     let response = next.run(req).await;
@@ -37,7 +43,7 @@ pub async fn layer(State(state): State<AppState>, req: Request, next: Next) -> R
     }
 
     let entry = AuditEntry {
-        trace_id: &request_id,
+        trace_id: &trace_id,
         request_id: &request_id,
         method: method.as_str(),
         path: &path,

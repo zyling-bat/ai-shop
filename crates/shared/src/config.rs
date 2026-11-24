@@ -24,6 +24,12 @@ pub const DEFAULT_JWT_ACCESS_TTL_SEC: u64 = 900;
 pub const DEFAULT_JWT_REFRESH_TTL_SEC: u64 = 1_209_600;
 /// 数据库连接池默认上限（06 §6.4）。
 pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 20;
+/// OTel 服务名默认值。
+pub const DEFAULT_OTEL_SERVICE_NAME: &str = "ecom-server";
+/// 请求体上限默认值：2 MiB。
+pub const DEFAULT_HTTP_BODY_LIMIT_BYTES: u32 = 2_097_152;
+/// 请求处理超时默认值（秒）。
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// 运行环境。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +186,61 @@ impl fmt::Debug for RedisConfig {
     }
 }
 
+/// 遥测配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    pub service_name: String,
+    /// 为空表示不安装 OTLP 导出器（trace 仍在本地生成，见 ADR-008）。
+    pub otlp_endpoint: Option<String>,
+}
+
+impl TelemetryConfig {
+    /// 从环境变量以宽松模式装载，供订阅器先行装配。
+    ///
+    /// 严格校验在 [`AppConfig::from_map`] 中完成；非法端点在此按未配置处理，
+    /// 保证配置错误仍能通过已装配的日志出口打印出来。
+    pub fn from_env() -> Self {
+        Self::from_map(&std::env::vars().collect())
+    }
+
+    /// 从键值集合以宽松模式装载。
+    pub fn from_map(vars: &BTreeMap<String, String>) -> Self {
+        let service_name = match lookup(vars, "OTEL_SERVICE_NAME") {
+            Some(raw) if raw.chars().any(char::is_whitespace) => {
+                DEFAULT_OTEL_SERVICE_NAME.to_owned()
+            }
+            Some(raw) => raw.to_owned(),
+            None => DEFAULT_OTEL_SERVICE_NAME.to_owned(),
+        };
+        let otlp_endpoint = lookup(vars, "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .filter(|raw| is_connection_url(raw, &["http", "https"]))
+            .map(str::to_owned);
+        Self {
+            service_name,
+            otlp_endpoint,
+        }
+    }
+}
+
+/// HTTP 请求护栏配置：请求体上限、处理超时与跨域白名单。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpConfig {
+    pub body_limit_bytes: u32,
+    pub timeout_secs: u64,
+    /// 允许的跨域来源；为空表示不放行任何跨域来源。
+    pub cors_allowed_origins: Vec<String>,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            body_limit_bytes: DEFAULT_HTTP_BODY_LIMIT_BYTES,
+            timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
+            cors_allowed_origins: Vec::new(),
+        }
+    }
+}
+
 /// 将连接串中的密码替换为 `***`，用于错误信息与 `Debug`。
 ///
 /// 只处理 `scheme://userinfo@rest` 形式；无 userinfo 或无密码时原样返回。
@@ -206,6 +267,8 @@ pub struct AppConfig {
     pub jwt: JwtConfig,
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
+    pub telemetry: TelemetryConfig,
+    pub http: HttpConfig,
 }
 
 impl AppConfig {
@@ -229,6 +292,8 @@ impl AppConfig {
         let jwt = parse_jwt(vars, &mut issues);
         let database = parse_database(vars, &mut issues);
         let redis = parse_redis(vars, &mut issues);
+        let telemetry = parse_telemetry(vars, &mut issues);
+        let http = parse_http(vars, &mut issues);
 
         if issues.is_empty() {
             Ok(Self {
@@ -238,6 +303,8 @@ impl AppConfig {
                 jwt,
                 database,
                 redis,
+                telemetry,
+                http,
             })
         } else {
             Err(ConfigError { issues })
@@ -523,6 +590,92 @@ fn parse_redis(vars: &BTreeMap<String, String>, issues: &mut Vec<ConfigIssue>) -
         Some(raw) => raw.to_owned(),
     };
     RedisConfig::new(url)
+}
+
+fn parse_telemetry(
+    vars: &BTreeMap<String, String>,
+    issues: &mut Vec<ConfigIssue>,
+) -> TelemetryConfig {
+    let service_name = match lookup(vars, "OTEL_SERVICE_NAME") {
+        None => DEFAULT_OTEL_SERVICE_NAME.to_owned(),
+        Some(raw) if raw.chars().any(char::is_whitespace) => {
+            issues.push(ConfigIssue::Invalid {
+                key: "OTEL_SERVICE_NAME",
+                value: raw.to_owned(),
+                expected: "非空且不含空白字符",
+            });
+            DEFAULT_OTEL_SERVICE_NAME.to_owned()
+        }
+        Some(raw) => raw.to_owned(),
+    };
+
+    let otlp_endpoint = match lookup(vars, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+        None => None,
+        Some(raw) if !is_connection_url(raw, &["http", "https"]) => {
+            issues.push(ConfigIssue::Invalid {
+                key: "OTEL_EXPORTER_OTLP_ENDPOINT",
+                value: redact_url(raw),
+                expected: "http:// 或 https:// 开头的 OTLP 端点",
+            });
+            None
+        }
+        Some(raw) => Some(raw.to_owned()),
+    };
+
+    TelemetryConfig {
+        service_name,
+        otlp_endpoint,
+    }
+}
+
+fn parse_http(vars: &BTreeMap<String, String>, issues: &mut Vec<ConfigIssue>) -> HttpConfig {
+    let body_limit_bytes = parse_positive_u32(
+        vars,
+        "HTTP_BODY_LIMIT_BYTES",
+        DEFAULT_HTTP_BODY_LIMIT_BYTES,
+        issues,
+    );
+    let timeout_secs = parse_ttl(vars, "HTTP_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT_SECS, issues);
+    let cors_allowed_origins = parse_cors_origins(vars, issues);
+
+    HttpConfig {
+        body_limit_bytes,
+        timeout_secs,
+        cors_allowed_origins,
+    }
+}
+
+fn parse_cors_origins(
+    vars: &BTreeMap<String, String>,
+    issues: &mut Vec<ConfigIssue>,
+) -> Vec<String> {
+    let Some(raw) = lookup(vars, "CORS_ALLOWED_ORIGINS") else {
+        return Vec::new();
+    };
+
+    let mut origins = Vec::new();
+    let mut invalid = Vec::new();
+    for origin in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if is_connection_url(origin, &["http", "https"]) && !origin.contains('*') {
+            origins.push(origin.to_owned());
+        } else {
+            invalid.push(origin.to_owned());
+        }
+    }
+
+    if !invalid.is_empty() {
+        issues.push(ConfigIssue::Invalid {
+            key: "CORS_ALLOWED_ORIGINS",
+            value: invalid.join(","),
+            expected: "逗号分隔的 http(s) 来源列表，例如 https://app.example.com",
+        });
+    }
+
+    origins
 }
 
 #[cfg(test)]
@@ -817,5 +970,122 @@ mod tests {
             redact_url("postgres://app:pw@db:5432/app"),
             "postgres://app:***@db:5432/app"
         );
+    }
+
+    #[test]
+    fn telemetry_defaults_apply() {
+        let config = AppConfig::from_map(&vars(&[("JWT_SECRET", SECRET)])).expect("配置装载成功");
+
+        assert_eq!(config.telemetry.service_name, DEFAULT_OTEL_SERVICE_NAME);
+        assert_eq!(config.telemetry.otlp_endpoint, None);
+    }
+
+    #[test]
+    fn otlp_endpoint_without_scheme_is_rejected() {
+        let error = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "127.0.0.1:4317"),
+        ]))
+        .expect_err("缺少 scheme 必须失败");
+
+        assert_eq!(error.issues.len(), 1);
+        assert_eq!(error.issues[0].key(), "OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn otlp_endpoint_accepts_http() {
+        let config = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317"),
+        ]))
+        .expect("合法端点应装载成功");
+
+        assert_eq!(
+            config.telemetry.otlp_endpoint.as_deref(),
+            Some("http://127.0.0.1:4317")
+        );
+    }
+
+    #[test]
+    fn blank_otlp_endpoint_means_disabled() {
+        let config = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "  "),
+        ]))
+        .expect("空白端点应按未配置处理");
+
+        assert_eq!(config.telemetry.otlp_endpoint, None);
+    }
+
+    #[test]
+    fn http_guard_defaults_apply() {
+        let config = AppConfig::from_map(&vars(&[("JWT_SECRET", SECRET)])).expect("配置装载成功");
+
+        assert_eq!(config.http.body_limit_bytes, DEFAULT_HTTP_BODY_LIMIT_BYTES);
+        assert_eq!(config.http.timeout_secs, DEFAULT_HTTP_TIMEOUT_SECS);
+        assert!(config.http.cors_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_origins_are_split_and_trimmed() {
+        let config = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            (
+                "CORS_ALLOWED_ORIGINS",
+                " https://app.example.com , http://localhost:3000 ",
+            ),
+        ]))
+        .expect("合法来源应装载成功");
+
+        assert_eq!(
+            config.http.cors_allowed_origins,
+            vec![
+                "https://app.example.com".to_owned(),
+                "http://localhost:3000".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_cors_origin_is_rejected() {
+        let error = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            ("CORS_ALLOWED_ORIGINS", "https://ok.example.com,*"),
+        ]))
+        .expect_err("通配来源必须失败");
+
+        assert_eq!(error.issues.len(), 1);
+        assert_eq!(error.issues[0].key(), "CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    fn zero_body_limit_is_rejected() {
+        let error = AppConfig::from_map(&vars(&[
+            ("JWT_SECRET", SECRET),
+            ("HTTP_BODY_LIMIT_BYTES", "0"),
+        ]))
+        .expect_err("请求体上限为 0 必须失败");
+
+        assert_eq!(error.issues[0].key(), "HTTP_BODY_LIMIT_BYTES");
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        let error =
+            AppConfig::from_map(&vars(&[("JWT_SECRET", SECRET), ("HTTP_TIMEOUT_SECS", "0")]))
+                .expect_err("超时为 0 必须失败");
+
+        assert_eq!(error.issues[0].key(), "HTTP_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn lenient_telemetry_ignores_invalid_endpoint() {
+        let telemetry = TelemetryConfig::from_map(&vars(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "127.0.0.1:4317"),
+            ("OTEL_SERVICE_NAME", "bad name"),
+        ]));
+
+        assert_eq!(telemetry.otlp_endpoint, None);
+        assert_eq!(telemetry.service_name, DEFAULT_OTEL_SERVICE_NAME);
     }
 }

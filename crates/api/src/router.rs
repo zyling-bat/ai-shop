@@ -5,25 +5,30 @@ use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::get;
 use tower::ServiceBuilder;
 
+use crate::guards;
 use crate::handlers::readyz::readyz;
 use crate::middleware::{audit, metrics, request_id, trace};
 use crate::state::AppState;
 
 /// 构造对外路由表。
 ///
-/// 中间件顺序按 06 §6.3.6：`RequestId → Trace → Metrics → Audit → Handler`；
-/// 审计依赖 `request_id` 写入的请求标识，因此必须排在其后。
+/// 中间件顺序按 06 §6.3.6：
+/// `RequestId → Trace → Metrics → CORS → BodyLimit → Timeout → Audit → Handler`。
+/// 审计依赖 `request_id` / `trace_id` 扩展，因此必须排在它们之后；
+/// 护栏排在审计之前，保证被拒绝的请求仍被计数与审计。
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let audited = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics::scrape))
+        .layer(from_fn_with_state(state.clone(), audit::layer));
+
+    guards::apply_guards(audited, &state.http)
         .layer(
             ServiceBuilder::new()
                 .layer(from_fn(request_id::layer))
                 .layer(from_fn(trace::layer))
-                .layer(from_fn(metrics::layer))
-                .layer(from_fn_with_state(state.clone(), audit::layer)),
+                .layer(from_fn(metrics::layer)),
         )
         .with_state(state)
 }
@@ -42,11 +47,30 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use metrics_exporter_prometheus::PrometheusHandle;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::TracerProvider;
+    use shared::config::HttpConfig;
     use tower::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::router;
     use crate::middleware::metrics;
     use crate::state::AppState;
+
+    /// 装配带 OTel 层的订阅器（进程内一次），使 `trace_id` 由 SDK 生成。
+    fn install_tracing() {
+        static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let provider = PROVIDER
+                .get_or_init(|| TracerProvider::builder().build())
+                .clone();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("api-tests")));
+            // INVARIANT: 测试进程内只装配一次全局订阅器。
+            tracing::subscriber::set_global_default(subscriber).expect("测试期装配订阅器失败");
+        });
+    }
 
     /// 进程内唯一记录器：`install` 只能成功一次，测试间共享同一份计数。
     fn handle() -> PrometheusHandle {
@@ -87,6 +111,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Recorded {
         trace_id: String,
+        request_id: String,
         method: String,
         path: String,
         status: u16,
@@ -113,6 +138,7 @@ mod tests {
                 .expect("审计记录锁被毒化")
                 .push(Recorded {
                     trace_id: entry.trace_id.to_owned(),
+                    request_id: entry.request_id.to_owned(),
                     method: entry.method.to_owned(),
                     path: entry.path.to_owned(),
                     status: entry.status,
@@ -132,12 +158,28 @@ mod tests {
         }
     }
 
+    fn state_with_config(
+        probes: Vec<Arc<dyn HealthProbe>>,
+        audit: Arc<dyn AuditSink>,
+        http: HttpConfig,
+    ) -> AppState {
+        AppState::new(handle(), Arc::new(Readiness::new(probes)), audit, http)
+    }
+
     fn state_with(probes: Vec<Arc<dyn HealthProbe>>, audit: Arc<dyn AuditSink>) -> AppState {
-        AppState::new(handle(), Arc::new(Readiness::new(probes)), audit)
+        state_with_config(probes, audit, HttpConfig::default())
     }
 
     fn app_with(probes: Vec<Arc<dyn HealthProbe>>, audit: Arc<dyn AuditSink>) -> axum::Router {
         router(state_with(probes, audit))
+    }
+
+    fn app_with_config(
+        probes: Vec<Arc<dyn HealthProbe>>,
+        audit: Arc<dyn AuditSink>,
+        http: HttpConfig,
+    ) -> axum::Router {
+        router(state_with_config(probes, audit, http))
     }
 
     fn app() -> axum::Router {
@@ -274,6 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_records_request_metadata() {
+        install_tracing();
         let sink = Arc::new(RecordingSink::default());
         let app = app_with(vec![probe("postgres", true)], sink.clone());
 
@@ -284,15 +327,106 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let entries = sink.entries();
-        assert_eq!(
-            entries,
-            vec![Recorded {
-                trace_id: "p0-trace-001".to_owned(),
-                method: "GET".to_owned(),
-                path: "/healthz".to_owned(),
-                status: 200,
-            }]
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.request_id, "p0-trace-001");
+        assert_eq!(entry.method, "GET");
+        assert_eq!(entry.path, "/healthz");
+        assert_eq!(entry.status, 200);
+        assert!(is_trace_id(&entry.trace_id), "trace_id 应为 32 位十六进制");
+        assert_ne!(
+            entry.trace_id, entry.request_id,
+            "trace_id 必须独立于 request_id"
         );
+    }
+
+    #[tokio::test]
+    async fn traceparent_is_continued() {
+        install_tracing();
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let sink = Arc::new(RecordingSink::default());
+        let app = app_with(vec![probe("postgres", true)], sink.clone());
+        let request = Request::builder()
+            .uri("/healthz")
+            .header("traceparent", traceparent)
+            .body(Body::empty())
+            // INVARIANT: 测试用静态 URI 与头部为合法字面量。
+            .expect("测试请求构造失败");
+
+        let response = app.oneshot(request).await.expect("路由调用失败");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-trace-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+
+        let entries = sink.entries();
+        assert_eq!(entries[0].trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_ne!(entries[0].request_id, entries[0].trace_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_traceparent_is_ignored() {
+        install_tracing();
+        let app = app();
+        let request = Request::builder()
+            .uri("/healthz")
+            .header("traceparent", "00-bad")
+            .body(Body::empty())
+            // INVARIANT: 同上。
+            .expect("测试请求构造失败");
+
+        let response = app.oneshot(request).await.expect("路由调用失败");
+        assert_eq!(response.status(), StatusCode::OK);
+        let trace_id = response
+            .headers()
+            .get("x-trace-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("响应必须带 x-trace-id");
+        assert!(
+            is_trace_id(trace_id),
+            "应生成新的 32 位 trace id：{trace_id}"
+        );
+        assert_ne!(trace_id, "00-bad");
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_counted() {
+        let app = app_with_config(
+            vec![probe("postgres", true)],
+            Arc::new(RecordingSink::default()),
+            HttpConfig {
+                body_limit_bytes: 16,
+                ..HttpConfig::default()
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/healthz")
+            .header(header::CONTENT_LENGTH, "32")
+            .body(Body::empty())
+            // INVARIANT: 同上。
+            .expect("测试请求构造失败");
+
+        let response = app.clone().oneshot(request).await.expect("路由调用失败");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = body_text(send(app, "/metrics").await).await;
+        assert!(
+            counter_value(&body, "/healthz", "413") >= 1.0,
+            "413 应被 Metrics 计数：{body}"
+        );
+    }
+
+    /// 32 位小写十六进制校验。
+    fn is_trace_id(value: &str) -> bool {
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
     #[tokio::test]
