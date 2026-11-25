@@ -8,10 +8,19 @@
 
 | ID | 位置 | 状态 | 问题 | 影响 | 触发偿还条件 | 负责人 | 登记日期 |
 |---|---|---|---|---|---|---|---|
-| TD-003 | `/metrics` 路由 | 待偿还 | 指标端点无鉴权、无抓取侧保护 | 端口直连公网时，路由模板与状态分布可被匿名读取 | ST-0.5 部署清单限制来源（Prometheus 网段 / ingress 白名单）或改独立管理端口，附抓取配置 | 架构 | 2026-11-24 |
+| TD-003 | `/metrics` 路由 | 待偿还 | 指标端点无鉴权、无抓取侧保护 | 端口直连公网时，路由模板与状态分布可被匿名读取 | ST-0.5 仅有依赖服务 compose，无应用/ingress，不触发也不伪装偿还；实际应用部署/P17 必须交付 `/metrics` 来源限制（Prometheus 网段 / ingress 白名单）或独立管理端口，附抓取配置并取得运行态证据 | 架构 | 2026-11-24 |
 | TD-004 | `crates/api/src/router.rs`、`crates/api/src/guards.rs` | 待偿还 | 中间件已落地 `RequestId → Trace → Metrics → CORS → BodyLimit → Timeout → Audit`，但缺 RateLimit / Auth / RBAC / Idempotency | 无认证与权限控制、无限流与幂等保护；当前仅只读探针接口，风险可接受 | Auth / RBAC / Idempotency 随 P2 / P5 落地，RateLimit 按接口写入压力在 P2 评估；每步附 Gate 证据 | 架构 | 2026-11-24 |
 | TD-005 | `crates/api/src/middleware/audit.rs`、`migrations/*_audit_log.*` | 待偿还 | 所有路径（`/metrics` 除外）逐请求同步写审计，探针请求同样留痕 | 生产探针频率会放大 `audit_log` 行数与写入延迟；单请求多一次 INSERT | P2 审计模块落地时按策略采样、排除 `/healthz`、`/readyz`，并评估批量/异步写入；需保留 P0-5 的可验证证据后再调整 | 架构 | 2026-11-24 |
-| TD-006 | `crates/infrastructure/src/{db,audit}.rs`、CI | 待偿还 | 本轮使用运行时 SQL（`query` / `query_scalar`），未接 `sqlx::query!` 编译期校验与 `.sqlx/` 离线元数据 | 字段/类型错误只能在运行期暴露；CI 未校验 SQL 与 schema 一致性 | 首个业务表查询的 ST（P1）起改用编译期查询，`.sqlx/` 入库并在 CI 设置 `SQLX_OFFLINE=true` 构建 | 架构 | 2026-11-24 |
+| TD-006 | `crates/infrastructure/src/{db,audit}.rs`、CI | 待偿还 | 本轮使用运行时 SQL（`query` / `query_scalar`），未接 `sqlx::query!` 编译期校验与 `.sqlx/` 离线元数据 | 字段/类型错误只能在运行期暴露；CI 未校验 SQL 与 schema 一致性 | 首个业务表查询的 ST（P1）起改用编译期查询，`.sqlx/` 入库，在 CI 设置 `SQLX_OFFLINE=true` 构建并接入 `cargo sqlx prepare --check` | 架构 | 2026-11-24 |
+| TD-007 | `.github/workflows/ci.yml`、未来 `xtask` / `deny` / 白名单机制 | 待偿还 | 当前 CI 仅含 fmt / clippy / test，缺 `cargo deny check`、`cargo xtask openapi --check`、`cargo xtask consistency --check`、`cargo xtask eval --smoke` 与通用 ST 白名单 diff 校验 | 依赖与许可证政策、OpenAPI 契约漂移、金额/库存/结算一致性、AI 冒烟评分回退及 ST 越界改动均无法由 CI 自动阻断 | 见表下“TD-007 接入分解”，各项按对应实现落地时接入；其中 cargo deny 与通用 ST diff 不晚于 P1 专项接入 | 架构 | 2026-11-25 |
+
+TD-007 接入分解：
+
+- `cargo deny check`：不晚于 P1 专项完成依赖与许可证政策设计并接入 CI。
+- 通用 ST 白名单 diff 校验：不晚于 P1 专项完成白名单格式设计并接入 CI。
+- `cargo xtask openapi --check`：在 utoipa 与 `xtask openapi` 生成器落地时接入 CI。
+- `cargo xtask consistency --check`：在对应金额/库存/结算一致性断言落地时接入 CI。
+- `cargo xtask eval --smoke`：在 P11-P13 对应评测能力与 evals 用例集落地时接入 CI。
 
 ## 已偿还
 
