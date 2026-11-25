@@ -1004,3 +1004,269 @@ BEGIN
 END;
 $$;
 
+-- ST-1.6 交易域断言：只读校验 + 事务内非法写入回滚，可重复执行。
+DO $$
+DECLARE
+    ok boolean;
+    tbl text;
+    idx text;
+BEGIN
+    -- 1. 12 张表存在（order 是保留字，quote_ident 会生成 "order"）
+    FOREACH tbl IN ARRAY ARRAY[
+        'cart', 'cart_item', 'order', 'order_item', 'order_amount_snapshot',
+        'order_address', 'order_status_log', 'order_remark', 'order_tag',
+        'invoice', 'invoice_item', 'price_calc_log'
+    ] LOOP
+        IF to_regclass('public.' || quote_ident(tbl)) IS NULL THEN
+            RAISE EXCEPTION '断言失败：% 不存在', tbl;
+        END IF;
+    END LOOP;
+
+    -- 2. 部分唯一索引：唯一 + WHERE deleted_at IS NULL（含 05 P1-2 点名的 uq_order_order_no）
+    FOREACH idx IN ARRAY ARRAY[
+        'uq_cart_user_id', 'uq_cart_item_cart_sku', 'uq_order_order_no',
+        'uq_order_amount_snapshot_order_no', 'uq_order_address_order_type',
+        'uq_order_tag_order_tag', 'uq_invoice_invoice_no',
+        'uq_invoice_item_invoice_order_item'
+    ] LOOP
+        SELECT i.indisunique
+               AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+        INTO ok
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = idx;
+
+        IF NOT COALESCE(ok, false) THEN
+            RAISE EXCEPTION '断言失败：% 缺失、非唯一或缺少软删条件', idx;
+        END IF;
+    END LOOP;
+
+    -- 3. 订单查询索引列序与部分条件
+    SELECT pg_get_indexdef(i.indexrelid) ILIKE '%(user_id, status, created_at DESC)%'
+    INTO ok
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'ix_order_user_status_created';
+
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：ix_order_user_status_created 缺失或列序不符';
+    END IF;
+
+    SELECT pg_get_indexdef(i.indexrelid) ILIKE '%(merchant_id, status, created_at DESC)%'
+    INTO ok
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'ix_order_merchant_status_created';
+
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：ix_order_merchant_status_created 缺失或列序不符';
+    END IF;
+
+    SELECT pg_get_expr(i.indpred, i.indrelid) ILIKE '%pending_pay%'
+    INTO ok
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'ix_order_pay_expire';
+
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：ix_order_pay_expire 缺失或未限定 pending_pay';
+    END IF;
+
+    -- 4. CHECK 约束存在
+    FOREACH idx IN ARRAY ARRAY[
+        'ck_order_status', 'ck_order_order_type', 'ck_order_pay_status',
+        'ck_order_ship_status', 'ck_order_after_sale_status', 'ck_order_channel',
+        'ck_order_amounts_non_negative', 'ck_order_item_qty', 'ck_order_item_refund_qty',
+        'ck_cart_item_qty', 'ck_invoice_amount', 'ck_invoice_item_tax_rate'
+    ] LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = idx AND contype = 'c'
+        ) THEN
+            RAISE EXCEPTION '断言失败：CHECK 约束 % 缺失', idx;
+        END IF;
+    END LOOP;
+
+    -- 5. 精度
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'order'
+          AND column_name = 'goods_amount'
+          AND data_type = 'numeric' AND numeric_precision = 20 AND numeric_scale = 4
+    ) THEN
+        RAISE EXCEPTION '断言失败："order".goods_amount 不是 NUMERIC(20,4)';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'invoice_item'
+          AND column_name = 'tax_rate'
+          AND data_type = 'numeric' AND numeric_precision = 10 AND numeric_scale = 6
+    ) THEN
+        RAISE EXCEPTION '断言失败：invoice_item.tax_rate 不是 NUMERIC(10,6)';
+    END IF;
+
+    -- 6. 非法写入必须被拒绝（每个子块独立回滚，不留数据）
+    BEGIN
+        INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id, status)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_STATUS', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'bogus');
+        RAISE EXCEPTION '断言失败："order".status 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id, order_type)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_TYPE', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'bogus');
+        RAISE EXCEPTION '断言失败："order".order_type 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id, channel)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_CHANNEL', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'bogus');
+        RAISE EXCEPTION '断言失败："order".channel 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id, goods_amount)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_AMOUNT', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败："order".goods_amount 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO order_item (id, order_id, order_no, spu_id, sku_id, qty, unit_price, item_amount)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'VERIFY_SO_ITEM_QTY', gen_random_uuid(), gen_random_uuid(), 0, 1, 1);
+        RAISE EXCEPTION '断言失败：order_item.qty 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO order_item (id, order_id, order_no, spu_id, sku_id, qty, unit_price, item_amount, refund_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'VERIFY_SO_ITEM_REFUND', gen_random_uuid(), gen_random_uuid(), 2, 1, 2, 3);
+        RAISE EXCEPTION '断言失败：order_item.refund_qty 接受了大于 qty 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO cart_item (id, cart_id, user_id, merchant_id, shop_id, spu_id, sku_id, qty, price_amount)
+        VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 0, 1);
+        RAISE EXCEPTION '断言失败：cart_item.qty 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO invoice (id, invoice_no, order_no, user_id, title, amount)
+        VALUES (gen_random_uuid(), 'VERIFY_INV_AMOUNT', 'VERIFY_SO_INV', gen_random_uuid(), 'verify', -1);
+        RAISE EXCEPTION '断言失败：invoice.amount 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO invoice_item (id, invoice_id, order_no, order_item_id, name, amount, tax_rate)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'VERIFY_SO_INV_ITEM', gen_random_uuid(), 'verify', 1, 1.5);
+        RAISE EXCEPTION '断言失败：invoice_item.tax_rate 接受了大于 1 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO order_address (id, order_no, address_type, receiver_name, receiver_phone_enc, province, city, district, detail_address)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_ADDR_TYPE', 'bogus', 'verify', 'verify-enc', '省', '市', '区', '地址');
+        RAISE EXCEPTION '断言失败：order_address.address_type 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- 7. 重复写入必须被唯一索引拒绝（子事务回滚）
+    BEGIN
+        INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_DUP', gen_random_uuid(), gen_random_uuid(), gen_random_uuid());
+
+        BEGIN
+            INSERT INTO "order" (id, order_no, user_id, merchant_id, shop_id)
+            VALUES (gen_random_uuid(), 'VERIFY_SO_DUP', gen_random_uuid(), gen_random_uuid(), gen_random_uuid());
+            RAISE EXCEPTION '断言失败："order" 接受了重复订单号';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_order_no';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_order_no' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        INSERT INTO cart_item (id, cart_id, user_id, merchant_id, shop_id, spu_id, sku_id, qty, price_amount)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000001301'::uuid, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), '01930000-0000-7000-8000-000000001302'::uuid, 1, 1);
+
+        BEGIN
+            INSERT INTO cart_item (id, cart_id, user_id, merchant_id, shop_id, spu_id, sku_id, qty, price_amount)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000001301'::uuid, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), '01930000-0000-7000-8000-000000001302'::uuid, 2, 1);
+            RAISE EXCEPTION '断言失败：cart_item 接受了同车同 SKU 两条明细';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_cart_item';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_cart_item' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        INSERT INTO order_amount_snapshot (id, order_no, calc_version, input, output)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_SNAP', 'v1', '{}'::jsonb, '{}'::jsonb);
+
+        BEGIN
+            INSERT INTO order_amount_snapshot (id, order_no, calc_version, input, output)
+            VALUES (gen_random_uuid(), 'VERIFY_SO_SNAP', 'v1', '{}'::jsonb, '{}'::jsonb);
+            RAISE EXCEPTION '断言失败：order_amount_snapshot 接受了同一订单两份快照';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_order_snapshot';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_order_snapshot' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        INSERT INTO order_address (id, order_no, address_type, receiver_name, receiver_phone_enc, province, city, district, detail_address)
+        VALUES (gen_random_uuid(), 'VERIFY_SO_ADDR_DUP', 'shipping', 'verify', 'verify-enc', '省', '市', '区', '地址');
+
+        BEGIN
+            INSERT INTO order_address (id, order_no, address_type, receiver_name, receiver_phone_enc, province, city, district, detail_address)
+            VALUES (gen_random_uuid(), 'VERIFY_SO_ADDR_DUP', 'shipping', 'verify2', 'verify-enc2', '省', '市', '区', '地址2');
+            RAISE EXCEPTION '断言失败：order_address 接受了同一订单两份收货地址';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_order_address';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_order_address' THEN
+                RAISE;
+            END IF;
+    END;
+
+    RAISE NOTICE 'P1 ST-1.6 交易域约束断言全部通过';
+END;
+$$;
+

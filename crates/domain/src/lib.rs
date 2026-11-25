@@ -1,3 +1,4 @@
 //! 领域层：实体、值对象、状态机、领域错误。
 
 pub mod inventory;
+pub mod trade;
