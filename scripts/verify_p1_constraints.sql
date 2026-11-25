@@ -248,3 +248,230 @@ BEGIN
 END;
 $$;
 
+-- ST-1.3 商家域断言：只读校验 + 事务内非法写入回滚，可重复执行。
+DO $$
+DECLARE
+    ok boolean;
+    tbl text;
+    idx text;
+BEGIN
+    -- 1. 12 张表存在
+    FOREACH tbl IN ARRAY ARRAY[
+        'merchant', 'merchant_qualification', 'merchant_contract', 'shop',
+        'shop_decoration', 'shop_score', 'shop_category_auth',
+        'merchant_violation', 'merchant_appeal',
+        'deposit_account', 'deposit_record', 'merchant_bank_account'
+    ] LOOP
+        IF to_regclass('public.' || quote_ident(tbl)) IS NULL THEN
+            RAISE EXCEPTION '断言失败：% 不存在', tbl;
+        END IF;
+    END LOOP;
+
+    -- 2. 部分唯一索引：唯一 + WHERE deleted_at IS NULL
+    FOREACH idx IN ARRAY ARRAY[
+        'uq_merchant_merchant_no', 'uq_merchant_contract_contract_no',
+        'uq_shop_shop_no', 'uq_shop_decoration_shop_page_version',
+        'uq_shop_score_shop_date', 'uq_shop_category_auth_shop_category',
+        'uq_merchant_appeal_appeal_no', 'uq_deposit_account_merchant_id',
+        'uq_deposit_record_record_no', 'uq_merchant_bank_account_no'
+    ] LOOP
+        SELECT i.indisunique
+               AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+        INTO ok
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = idx;
+
+        IF NOT COALESCE(ok, false) THEN
+            RAISE EXCEPTION '断言失败：% 缺失、非唯一或缺少软删条件', idx;
+        END IF;
+    END LOOP;
+
+    -- 3. 带业务过滤条件的唯一索引
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%business_license%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_merchant_qualification_merchant_type';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_merchant_qualification_merchant_type 缺失或未限定执照/法人证件';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_published%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_shop_decoration_published';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_shop_decoration_published 缺失或未限定 is_published';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_default%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_merchant_bank_account_default';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_merchant_bank_account_default 缺失或未限定 is_default';
+    END IF;
+
+    -- 4. CHECK 约束存在
+    FOREACH idx IN ARRAY ARRAY[
+        'ck_merchant_type', 'ck_merchant_status', 'ck_merchant_settle_cycle', 'ck_merchant_commission_rate',
+        'ck_merchant_qualification_type', 'ck_merchant_qualification_status', 'ck_merchant_qualification_period',
+        'ck_merchant_contract_type', 'ck_merchant_contract_status', 'ck_merchant_contract_settle_cycle',
+        'ck_merchant_contract_commission_rate', 'ck_merchant_contract_period',
+        'ck_shop_status', 'ck_shop_dsr_desc', 'ck_shop_dsr_service', 'ck_shop_dsr_logistics',
+        'ck_shop_decoration_page', 'ck_shop_decoration_version',
+        'ck_shop_score_dsr_desc', 'ck_shop_score_dsr_service', 'ck_shop_score_dsr_logistics',
+        'ck_shop_score_review_count', 'ck_shop_score_good_rate',
+        'ck_shop_category_auth_status', 'ck_shop_category_auth_source',
+        'ck_shop_category_auth_rate', 'ck_shop_category_auth_period',
+        'ck_merchant_violation_type', 'ck_merchant_violation_level', 'ck_merchant_violation_penalty_type',
+        'ck_merchant_violation_penalty_amount', 'ck_merchant_violation_points_deduct', 'ck_merchant_violation_status',
+        'ck_merchant_appeal_type', 'ck_merchant_appeal_status', 'ck_merchant_appeal_violation',
+        'ck_deposit_account_balance_amount', 'ck_deposit_account_frozen_amount', 'ck_deposit_account_frozen_le_balance',
+        'ck_deposit_record_direction', 'ck_deposit_record_amount', 'ck_deposit_record_balance_after',
+        'ck_deposit_record_biz_type', 'ck_deposit_record_status',
+        'ck_merchant_bank_account_status'
+    ] LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = idx AND contype = 'c'
+        ) THEN
+            RAISE EXCEPTION '断言失败：CHECK 约束 % 缺失', idx;
+        END IF;
+    END LOOP;
+
+    -- 5. 关键列与精度
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'shop'
+          AND column_name = 'dsr_desc' AND numeric_precision = 3 AND numeric_scale = 2
+    ) THEN
+        RAISE EXCEPTION '断言失败：shop.dsr_desc 缺失或精度不是 NUMERIC(3,2)';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'merchant'
+          AND column_name = 'commission_rate' AND numeric_precision = 10 AND numeric_scale = 6
+    ) THEN
+        RAISE EXCEPTION '断言失败：merchant.commission_rate 缺失或精度不是 NUMERIC(10,6)';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'deposit_account'
+          AND column_name = 'balance_amount' AND numeric_precision = 20 AND numeric_scale = 4
+    ) THEN
+        RAISE EXCEPTION '断言失败：deposit_account.balance_amount 缺失或精度不是 NUMERIC(20,4)';
+    END IF;
+
+    -- 6. 非法写入必须被拒绝（每个子块独立回滚，不留数据）
+    BEGIN
+        INSERT INTO merchant (id, merchant_no, name, type, status)
+        VALUES (gen_random_uuid(), 'VERIFY_BAD_STATUS', 'verify', 'company', 'bogus');
+        RAISE EXCEPTION '断言失败：merchant.status 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO merchant (id, merchant_no, name, type, commission_rate)
+        VALUES (gen_random_uuid(), 'VERIFY_BAD_RATE', 'verify', 'company', 1.5);
+        RAISE EXCEPTION '断言失败：merchant.commission_rate 接受了大于 1 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO shop (id, merchant_id, shop_no, name, dsr_desc)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'VERIFY_BAD_DSR', 'verify', 6);
+        RAISE EXCEPTION '断言失败：shop.dsr_desc 接受了大于 5 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO deposit_account (id, merchant_id, balance_amount)
+        VALUES (gen_random_uuid(), gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败：deposit_account.balance_amount 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO deposit_account (id, merchant_id, balance_amount, frozen_amount)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 10, 20);
+        RAISE EXCEPTION '断言失败：deposit_account 接受了冻结金额大于余额的组合';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO deposit_record (id, account_id, merchant_id, record_no, direction, amount, balance_after, biz_type)
+        VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'VERIFY_BAD_AMOUNT', 'in', 0, 0, 'recharge');
+        RAISE EXCEPTION '断言失败：deposit_record.amount 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- 同一页面只能有一个已发布版本
+    BEGIN
+        INSERT INTO shop_decoration (id, shop_id, page, version, is_published)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009901'::uuid, 'home', 1, true);
+
+        BEGIN
+            INSERT INTO shop_decoration (id, shop_id, page, version, is_published)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009901'::uuid, 'home', 2, true);
+            RAISE EXCEPTION '断言失败：shop_decoration 接受了同页面两个已发布版本';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_decoration';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_decoration' THEN
+                RAISE;
+            END IF;
+    END;
+
+    -- 每个商家只能有一个默认银行卡
+    BEGIN
+        INSERT INTO merchant_bank_account (id, merchant_id, account_no_enc, account_no_hash, account_no_last4, bank_name, holder, is_default)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009902'::uuid, 'enc-1', 'verify-hash-1', '0001', 'verify', 'verify', true);
+
+        BEGIN
+            INSERT INTO merchant_bank_account (id, merchant_id, account_no_enc, account_no_hash, account_no_last4, bank_name, holder, is_default)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009902'::uuid, 'enc-2', 'verify-hash-2', '0002', 'verify', 'verify', true);
+            RAISE EXCEPTION '断言失败：merchant_bank_account 接受了同商家两个默认账户';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_bank';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_bank' THEN
+                RAISE;
+            END IF;
+    END;
+
+    -- 营业执照每个商家只能一份
+    BEGIN
+        INSERT INTO merchant_qualification (id, merchant_id, qual_type, file_url)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009903'::uuid, 'business_license', 'https://verify/1.pdf');
+
+        BEGIN
+            INSERT INTO merchant_qualification (id, merchant_id, qual_type, file_url)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009903'::uuid, 'business_license', 'https://verify/2.pdf');
+            RAISE EXCEPTION '断言失败：merchant_qualification 接受了同商家两份营业执照';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_qualification';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_qualification' THEN
+                RAISE;
+            END IF;
+    END;
+
+    RAISE NOTICE 'P1 ST-1.3 商家域约束断言全部通过';
+END;
+$$;
+
