@@ -704,3 +704,303 @@ BEGIN
 END;
 $$;
 
+-- ST-1.5：库存与供应链域 21 张表
+DO $$
+DECLARE
+    ok boolean;
+    tbl text;
+    idx text;
+BEGIN
+    -- 1. 21 张表存在
+    FOREACH tbl IN ARRAY ARRAY[
+        'warehouse', 'warehouse_zone',
+        'sku_stock', 'sku_stock_batch', 'stock_log', 'stock_reserve', 'stock_allocate_rule',
+        'transfer_order', 'transfer_order_item', 'stock_count', 'stock_count_item',
+        'supplier', 'supplier_sku',
+        'purchase_order', 'purchase_order_item',
+        'inbound_order', 'inbound_order_item',
+        'purchase_return', 'supplier_settlement', 'supplier_payment', 'production_order'
+    ] LOOP
+        IF to_regclass('public.' || quote_ident(tbl)) IS NULL THEN
+            RAISE EXCEPTION '断言失败：% 不存在', tbl;
+        END IF;
+    END LOOP;
+
+    -- 2. 部分唯一索引：唯一 + WHERE deleted_at IS NULL
+    FOREACH idx IN ARRAY ARRAY[
+        'uq_warehouse_no', 'uq_warehouse_zone_warehouse_zone_no',
+        'uq_sku_stock_sku_warehouse', 'uq_sku_stock_batch_sku_warehouse_batch',
+        'uq_stock_reserve_reserve_no', 'uq_stock_reserve_biz',
+        'uq_transfer_order_no', 'uq_transfer_order_item_no_sku_batch',
+        'uq_stock_count_no', 'uq_stock_count_item_no_sku_batch',
+        'uq_supplier_no', 'uq_supplier_sku_supplier_sku',
+        'uq_purchase_order_no', 'uq_purchase_order_item_po_sku',
+        'uq_inbound_order_no', 'uq_inbound_order_item_no_sku_batch',
+        'uq_purchase_return_no',
+        'uq_supplier_settlement_no', 'uq_supplier_settlement_supplier_period',
+        'uq_supplier_payment_no'
+    ] LOOP
+        SELECT i.indisunique
+               AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+        INTO ok
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = idx;
+
+        IF NOT COALESCE(ok, false) THEN
+            RAISE EXCEPTION '断言失败：% 缺失、非唯一或缺少软删条件', idx;
+        END IF;
+    END LOOP;
+
+    -- 3. 带业务过滤条件的唯一索引
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_default%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_warehouse_default';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_warehouse_default 缺失或未限定 is_default';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_primary%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_supplier_sku_primary';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_supplier_sku_primary 缺失或未限定 is_primary';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%channel_txn_id IS NOT NULL%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_supplier_payment_channel_txn';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_supplier_payment_channel_txn 缺失或未限定 channel_txn_id';
+    END IF;
+
+    -- 4. NULLS NOT DISTINCT 尾批号唯一索引
+    FOREACH idx IN ARRAY ARRAY[
+        'uq_transfer_order_item_no_sku_batch',
+        'uq_stock_count_item_no_sku_batch',
+        'uq_inbound_order_item_no_sku_batch'
+    ] LOOP
+        SELECT i.indisunique
+               AND i.indnullsnotdistinct
+               AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+        INTO ok
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = idx;
+
+        IF NOT COALESCE(ok, false) THEN
+            RAISE EXCEPTION '断言失败：% 缺失、非唯一、无软删条件或未启用 NULLS NOT DISTINCT', idx;
+        END IF;
+    END LOOP;
+
+    -- 5. CHECK 约束存在（含 05 P1-2 点名的 sku_stock 三个 CHECK）
+    FOREACH idx IN ARRAY ARRAY[
+        'ck_warehouse_type', 'ck_warehouse_status',
+        'ck_warehouse_zone_status',
+        'ck_sku_stock_available_qty', 'ck_sku_stock_locked_qty', 'ck_sku_stock_occupied_qty',
+        'ck_sku_stock_safety_qty', 'ck_sku_stock_version',
+        'ck_sku_stock_batch_qty', 'ck_sku_stock_batch_period', 'ck_sku_stock_batch_status',
+        'ck_stock_log_change_type',
+        'ck_stock_reserve_biz_type', 'ck_stock_reserve_qty', 'ck_stock_reserve_status',
+        'ck_stock_allocate_rule_type', 'ck_stock_allocate_rule_min_qty', 'ck_stock_allocate_rule_status',
+        'ck_transfer_order_status', 'ck_transfer_order_total_qty', 'ck_transfer_order_distinct_warehouse',
+        'ck_transfer_order_item_qty', 'ck_transfer_order_item_received_qty',
+        'ck_stock_count_status', 'ck_stock_count_type',
+        'ck_stock_count_item_book_qty', 'ck_stock_count_item_actual_qty', 'ck_stock_count_item_diff',
+        'ck_supplier_type', 'ck_supplier_settle_cycle', 'ck_supplier_status',
+        'ck_supplier_sku_supply_price', 'ck_supplier_sku_min_order_qty',
+        'ck_supplier_sku_lead_time_days', 'ck_supplier_sku_status',
+        'ck_purchase_order_status', 'ck_purchase_order_total_amount',
+        'ck_purchase_order_item_qty', 'ck_purchase_order_item_received_qty',
+        'ck_purchase_order_item_price_amount',
+        'ck_inbound_order_status', 'ck_inbound_order_total_qty',
+        'ck_inbound_order_item_qty', 'ck_inbound_order_item_received_qty',
+        'ck_inbound_order_item_price_amount', 'ck_inbound_order_item_period',
+        'ck_purchase_return_status', 'ck_purchase_return_total_qty', 'ck_purchase_return_total_amount',
+        'ck_supplier_settlement_period', 'ck_supplier_settlement_gross_amount',
+        'ck_supplier_settlement_return_amount', 'ck_supplier_settlement_net_amount',
+        'ck_supplier_settlement_status',
+        'ck_supplier_payment_amount', 'ck_supplier_payment_method', 'ck_supplier_payment_status',
+        'ck_production_order_qty', 'ck_production_order_completed_qty', 'ck_production_order_status'
+    ] LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = idx AND contype = 'c'
+        ) THEN
+            RAISE EXCEPTION '断言失败：CHECK 约束 % 缺失', idx;
+        END IF;
+    END LOOP;
+
+    -- 6. 关键列类型与精度
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'supplier_sku'
+          AND column_name = 'supply_price' AND numeric_precision = 20 AND numeric_scale = 4
+    ) THEN
+        RAISE EXCEPTION '断言失败：supplier_sku.supply_price 缺失或精度不是 NUMERIC(20,4)';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'purchase_order'
+          AND column_name = 'total_amount' AND numeric_precision = 20 AND numeric_scale = 4
+    ) THEN
+        RAISE EXCEPTION '断言失败：purchase_order.total_amount 缺失或精度不是 NUMERIC(20,4)';
+    END IF;
+
+    -- 7. 非法写入必须被拒绝（每个子块独立回滚，不留数据）
+    BEGIN
+        INSERT INTO sku_stock (id, sku_id, warehouse_id, available_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败：sku_stock.available_qty 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO sku_stock (id, sku_id, warehouse_id, locked_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败：sku_stock.locked_qty 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO sku_stock (id, sku_id, warehouse_id, occupied_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败：sku_stock.occupied_qty 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO stock_reserve (id, reserve_no, biz_type, biz_no, sku_id, warehouse_id, qty)
+        VALUES (gen_random_uuid(), 'VERIFY_RESERVE_ZERO', 'order', 'VERIFY_BIZ', gen_random_uuid(), gen_random_uuid(), 0);
+        RAISE EXCEPTION '断言失败：stock_reserve.qty 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO transfer_order (id, transfer_no, from_warehouse_id, to_warehouse_id)
+        VALUES (gen_random_uuid(), 'VERIFY_TRANSFER_SAME',
+                '01930000-0000-7000-8000-000000009906'::uuid,
+                '01930000-0000-7000-8000-000000009906'::uuid);
+        RAISE EXCEPTION '断言失败：transfer_order 接受了同一出入库仓';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO stock_count_item (id, count_no, sku_id, book_qty, actual_qty, diff_qty)
+        VALUES (gen_random_uuid(), 'VERIFY_COUNT_DIFF', gen_random_uuid(), 5, 3, 0);
+        RAISE EXCEPTION '断言失败：stock_count_item.diff_qty 与 actual_qty - book_qty 不一致仍被接受';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO purchase_order_item (id, po_no, sku_id, qty, received_qty, price_amount)
+        VALUES (gen_random_uuid(), 'VERIFY_PO_OVER', gen_random_uuid(), 3, 4, 10);
+        RAISE EXCEPTION '断言失败：purchase_order_item.received_qty 接受了大于 qty 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO inbound_order_item (id, inbound_no, sku_id, qty, production_at, expire_at)
+        VALUES (gen_random_uuid(), 'VERIFY_INBOUND_PERIOD', gen_random_uuid(), 1, DATE '2026-02-01', DATE '2026-01-01');
+        RAISE EXCEPTION '断言失败：inbound_order_item.expire_at 早于 production_at 仍被接受';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO supplier_payment (id, payment_no, supplier_id, amount)
+        VALUES (gen_random_uuid(), 'VERIFY_PAY_ZERO', gen_random_uuid(), 0);
+        RAISE EXCEPTION '断言失败：supplier_payment.amount 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO supplier_settlement (id, settlement_no, supplier_id, period_start, period_end, gross_amount, return_amount, net_amount)
+        VALUES (gen_random_uuid(), 'VERIFY_SETTLE_NET', gen_random_uuid(), DATE '2026-01-01', DATE '2026-01-31', 100, 10, 0);
+        RAISE EXCEPTION '断言失败：supplier_settlement.net_amount 与 gross - return 不一致仍被接受';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO production_order (id, production_no, supplier_id, sku_id, qty, completed_qty)
+        VALUES (gen_random_uuid(), 'VERIFY_PROD_OVER', gen_random_uuid(), gen_random_uuid(), 2, 3);
+        RAISE EXCEPTION '断言失败：production_order.completed_qty 接受了大于 qty 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- 同一 SKU 同一仓库只能有一条库存
+    BEGIN
+        INSERT INTO sku_stock (id, sku_id, warehouse_id, available_qty)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009901'::uuid, '01930000-0000-7000-8000-000000009902'::uuid, 10);
+
+        BEGIN
+            INSERT INTO sku_stock (id, sku_id, warehouse_id, available_qty)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000009901'::uuid, '01930000-0000-7000-8000-000000009902'::uuid, 20);
+            RAISE EXCEPTION '断言失败：sku_stock 接受了同一 SKU 同一仓库两条库存';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_sku_stock';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_sku_stock' THEN
+                RAISE;
+            END IF;
+    END;
+
+    -- 同一单据同一 SKU 同一仓库同一状态只能有一条预占
+    BEGIN
+        INSERT INTO stock_reserve (id, reserve_no, biz_type, biz_no, sku_id, warehouse_id, qty, status)
+        VALUES (gen_random_uuid(), 'VERIFY_RESERVE_1', 'order', 'VERIFY_BIZ_DUP', '01930000-0000-7000-8000-000000009903'::uuid, '01930000-0000-7000-8000-000000009904'::uuid, 2, 'reserved');
+
+        BEGIN
+            INSERT INTO stock_reserve (id, reserve_no, biz_type, biz_no, sku_id, warehouse_id, qty, status)
+            VALUES (gen_random_uuid(), 'VERIFY_RESERVE_2', 'order', 'VERIFY_BIZ_DUP', '01930000-0000-7000-8000-000000009903'::uuid, '01930000-0000-7000-8000-000000009904'::uuid, 3, 'reserved');
+            RAISE EXCEPTION '断言失败：stock_reserve 接受了重复预占';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_stock_reserve';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_stock_reserve' THEN
+                RAISE;
+            END IF;
+    END;
+
+    -- 同一渠道流水号只能出账一次
+    BEGIN
+        INSERT INTO supplier_payment (id, payment_no, supplier_id, amount, pay_method, channel_txn_id)
+        VALUES (gen_random_uuid(), 'VERIFY_PAY_1', '01930000-0000-7000-8000-000000009905'::uuid, 10, 'bank', 'VERIFY_TXN_DUP');
+
+        BEGIN
+            INSERT INTO supplier_payment (id, payment_no, supplier_id, amount, pay_method, channel_txn_id)
+            VALUES (gen_random_uuid(), 'VERIFY_PAY_2', '01930000-0000-7000-8000-000000009905'::uuid, 20, 'bank', 'VERIFY_TXN_DUP');
+            RAISE EXCEPTION '断言失败：supplier_payment 接受了重复渠道流水号';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_supplier_payment';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_supplier_payment' THEN
+                RAISE;
+            END IF;
+    END;
+
+    RAISE NOTICE 'P1 ST-1.5 库存与供应链域约束断言全部通过';
+END;
+$$;
+
