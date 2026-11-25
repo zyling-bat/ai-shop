@@ -475,3 +475,232 @@ BEGIN
 END;
 $$;
 
+-- ST-1.4 商品域断言：只读校验 + 事务内非法写入回滚，可重复执行。
+DO $$
+DECLARE
+    ok boolean;
+    tbl text;
+    idx text;
+BEGIN
+    -- 1. 18 张表存在
+    FOREACH tbl IN ARRAY ARRAY[
+        'category', 'category_attr', 'category_attr_value', 'brand',
+        'spu', 'spu_attr_value', 'sku', 'sku_spec', 'sku_media', 'sku_price',
+        'product_media', 'product_detail', 'product_audit',
+        'freight_template', 'freight_template_rule',
+        'product_tag', 'product_limit', 'product_qa'
+    ] LOOP
+        IF to_regclass('public.' || quote_ident(tbl)) IS NULL THEN
+            RAISE EXCEPTION '断言失败：% 不存在', tbl;
+        END IF;
+    END LOOP;
+
+    -- 2. 部分唯一索引：唯一 + WHERE deleted_at IS NULL
+    FOREACH idx IN ARRAY ARRAY[
+        'uq_category_code', 'uq_category_attr_category_code',
+        'uq_category_attr_value_attr_value', 'uq_brand_name', 'uq_spu_spu_no',
+        'uq_spu_attr_value_spu_attr', 'uq_sku_sku_no', 'uq_sku_spu_barcode',
+        'uq_sku_spec_sku_attr', 'uq_sku_media_main', 'uq_product_media_main',
+        'uq_product_detail_spu_id', 'uq_product_audit_target_round',
+        'uq_freight_template_merchant_name', 'uq_product_tag_spu_tag',
+        'uq_product_limit_scope_target_type'
+    ] LOOP
+        SELECT i.indisunique
+               AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+        INTO ok
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = idx;
+
+        IF NOT COALESCE(ok, false) THEN
+            RAISE EXCEPTION '断言失败：% 缺失、非唯一或缺少软删条件', idx;
+        END IF;
+    END LOOP;
+
+    -- 3. 带业务过滤条件的唯一索引
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_main%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_sku_media_main';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_sku_media_main 缺失或未限定 is_main';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_main%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_product_media_main';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_product_media_main 缺失或未限定 is_main';
+    END IF;
+
+    SELECT i.indisunique AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_default%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_freight_template_default';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_freight_template_default 缺失或未限定 is_default';
+    END IF;
+
+    -- 4. sku_price 唯一索引：唯一 + 软删条件 + NULLS NOT DISTINCT
+    SELECT i.indisunique
+           AND i.indnullsnotdistinct
+           AND pg_get_expr(i.indpred, i.indrelid) ILIKE '%deleted_at IS NULL%'
+    INTO ok FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'uq_sku_price_sku_type_region_start';
+    IF NOT COALESCE(ok, false) THEN
+        RAISE EXCEPTION '断言失败：uq_sku_price_sku_type_region_start 缺失、非唯一、无软删条件或未启用 NULLS NOT DISTINCT';
+    END IF;
+
+    -- 5. CHECK 约束存在
+    FOREACH idx IN ARRAY ARRAY[
+        'ck_category_level', 'ck_category_status',
+        'ck_category_attr_type', 'ck_category_attr_input_type', 'ck_category_attr_status',
+        'ck_category_attr_value_status', 'ck_brand_status',
+        'ck_spu_status', 'ck_spu_audit_status',
+        'ck_sku_status', 'ck_sku_weight_g', 'ck_sku_volume_cm3', 'ck_sku_version',
+        'ck_sku_media_type',
+        'ck_sku_price_type', 'ck_sku_price_amount', 'ck_sku_price_min_qty',
+        'ck_sku_price_max_qty', 'ck_sku_price_period', 'ck_sku_price_status',
+        'ck_product_media_type', 'ck_product_detail_version',
+        'ck_product_audit_target_type', 'ck_product_audit_status', 'ck_product_audit_result',
+        'ck_product_audit_round', 'ck_product_audit_machine_score',
+        'ck_freight_template_charge_type', 'ck_freight_template_free_threshold', 'ck_freight_template_status',
+        'ck_freight_template_rule_first_qty', 'ck_freight_template_rule_first_amount',
+        'ck_freight_template_rule_extra_qty', 'ck_freight_template_rule_extra_amount',
+        'ck_product_tag_source',
+        'ck_product_limit_scope', 'ck_product_limit_type', 'ck_product_limit_qty',
+        'ck_product_limit_period', 'ck_product_limit_status',
+        'ck_product_qa_source', 'ck_product_qa_status'
+    ] LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = idx AND contype = 'c'
+        ) THEN
+            RAISE EXCEPTION '断言失败：CHECK 约束 % 缺失', idx;
+        END IF;
+    END LOOP;
+
+    -- 6. 关键列类型与精度
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'sku_price'
+          AND column_name = 'price_amount' AND numeric_precision = 20 AND numeric_scale = 4
+    ) THEN
+        RAISE EXCEPTION '断言失败：sku_price.price_amount 缺失或精度不是 NUMERIC(20,4)';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'product_audit'
+          AND column_name = 'machine_score' AND numeric_precision = 5 AND numeric_scale = 2
+    ) THEN
+        RAISE EXCEPTION '断言失败：product_audit.machine_score 缺失或精度不是 NUMERIC(5,2)';
+    END IF;
+
+    -- 7. 非法写入必须被拒绝（每个子块独立回滚，不留数据）
+    BEGIN
+        INSERT INTO spu (id, spu_no, merchant_id, shop_id, category_id, title, status)
+        VALUES (gen_random_uuid(), 'VERIFY_BAD_SPU_STATUS', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'verify', 'bogus');
+        RAISE EXCEPTION '断言失败：spu.status 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO sku (id, sku_no, spu_id, version)
+        VALUES (gen_random_uuid(), 'VERIFY_BAD_SKU_VERSION', gen_random_uuid(), -1);
+        RAISE EXCEPTION '断言失败：sku.version 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO sku_price (id, sku_id, price_type, price_amount)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'sale', -1);
+        RAISE EXCEPTION '断言失败：sku_price.price_amount 接受了负数';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO sku_price (id, sku_id, price_type, price_amount, min_qty, max_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 'tier', 10, 5, 3);
+        RAISE EXCEPTION '断言失败：sku_price.max_qty 接受了小于 min_qty 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO product_audit (id, target_type, target_id, machine_score)
+        VALUES (gen_random_uuid(), 'spu', gen_random_uuid(), 101);
+        RAISE EXCEPTION '断言失败：product_audit.machine_score 接受了大于 100 的值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO product_limit (id, scope, target_id, limit_type, limit_qty)
+        VALUES (gen_random_uuid(), 'skuy', gen_random_uuid(), 'per_user', 1);
+        RAISE EXCEPTION '断言失败：product_limit.scope 接受了非法值';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO product_limit (id, scope, target_id, limit_type, limit_qty)
+        VALUES (gen_random_uuid(), 'sku', gen_random_uuid(), 'per_user', 0);
+        RAISE EXCEPTION '断言失败：product_limit.limit_qty 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    BEGIN
+        INSERT INTO freight_template_rule (id, template_id, first_qty)
+        VALUES (gen_random_uuid(), gen_random_uuid(), 0);
+        RAISE EXCEPTION '断言失败：freight_template_rule.first_qty 接受了 0';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- 每个 SPU 只能有一张主图
+    BEGIN
+        INSERT INTO product_media (id, spu_id, media_type, url, is_main)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000008801'::uuid, 'image', 'https://verify/1.jpg', true);
+
+        BEGIN
+            INSERT INTO product_media (id, spu_id, media_type, url, is_main)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000008801'::uuid, 'image', 'https://verify/2.jpg', true);
+            RAISE EXCEPTION '断言失败：product_media 接受了同一 SPU 两张主图';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_product_media';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_product_media' THEN
+                RAISE;
+            END IF;
+    END;
+
+    -- 每个商家只能有一个默认运费模板
+    BEGIN
+        INSERT INTO freight_template (id, merchant_id, name, is_default)
+        VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000008802'::uuid, 'verify-default-1', true);
+
+        BEGIN
+            INSERT INTO freight_template (id, merchant_id, name, is_default)
+            VALUES (gen_random_uuid(), '01930000-0000-7000-8000-000000008802'::uuid, 'verify-default-2', true);
+            RAISE EXCEPTION '断言失败：freight_template 接受了同商家两个默认模板';
+        EXCEPTION
+            WHEN unique_violation THEN NULL;
+        END;
+
+        RAISE EXCEPTION 'rollback_verify_freight';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback_verify_freight' THEN
+                RAISE;
+            END IF;
+    END;
+
+    RAISE NOTICE 'P1 ST-1.4 商品域约束断言全部通过';
+END;
+$$;
+
